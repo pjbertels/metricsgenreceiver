@@ -96,3 +96,41 @@ func TestScenarioCfg_ForceExponentialHistograms(t *testing.T) {
 		assert.False(t, scenario.ForceExponentialHistograms())
 	})
 }
+
+func TestConfig_Validate_InstanceIDOffset(t *testing.T) {
+	t.Run("rejects negative instance_id_offset", func(t *testing.T) {
+		cfg := &Config{
+			Interval: 30 * time.Second,
+			StartTime: time.Now().Add(-time.Hour),
+			EndTime:   time.Now(),
+			Scenarios: []ScenarioCfg{
+				{Path: "builtin/simple", Scale: 10, InstanceIDOffset: -1},
+			},
+		}
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "instance_id_offset")
+	})
+	t.Run("accepts zero instance_id_offset", func(t *testing.T) {
+		cfg := &Config{
+			Interval:  30 * time.Second,
+			StartTime: time.Now().Add(-time.Hour),
+			EndTime:   time.Now(),
+			Scenarios: []ScenarioCfg{
+				{Path: "builtin/simple", Scale: 10},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+	t.Run("accepts positive instance_id_offset", func(t *testing.T) {
+		cfg := &Config{
+			Interval:  30 * time.Second,
+			StartTime: time.Now().Add(-time.Hour),
+			EndTime:   time.Now(),
+			Scenarios: []ScenarioCfg{
+				{Path: "builtin/simple", Scale: 10, InstanceIDOffset: 100},
+			},
+		}
+		assert.NoError(t, cfg.Validate())
+	})
+}

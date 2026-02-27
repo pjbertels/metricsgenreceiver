@@ -1,0 +1,19 @@
+# Coordinator config for the sync example (two collectors, 5m @ 1s interval).
+# Matches docs/sync-otelcol-instance-a.yaml and docs/sync-otelcol-instance-b.yaml.
+#
+# Run from the metricsgenreceiver directory:
+#   go run ./cmd/sync-coordinator -config cmd/sync-coordinator/coordinator-example.yaml
+#
+# Ensure NATS is running (e.g. docker run -p 4222:4222 nats:latest).
+# Start both collectors (instance A and B), then start this coordinator.
+
+nats_url: "nats://localhost:4222"
+subject_tick: "metricsgen.sync.tick"
+subject_done: "metricsgen.sync.done"
+num_instances: 2
+
+start_time: "2026-02-14T21:47:41Z"
+end_time: "2026-02-14T21:52:41Z"
+interval: 1s
+
+done_timeout: 5m

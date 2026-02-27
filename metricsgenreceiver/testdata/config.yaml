@@ -4,5 +4,5 @@ metricsgen:
   interval: 30s
   seed: 123
   scenarios:
-  - path: testdata/metricstemplate
-    scale: 10
+    - path: testdata/metricstemplate
+      scale: 10

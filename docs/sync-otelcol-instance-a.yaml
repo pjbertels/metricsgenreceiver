@@ -1,0 +1,52 @@
+# Collector config: instance A (sync mode, host-0).
+# Use with NATS and the sync-coordinator; run with instance B and coordinator.
+# Same pipeline as standalone (hostmetrics, scale 1, ES), with sync and instance_id_offset.
+
+receivers:
+  metricsgen:
+    sync:
+      enabled: true
+      nats_url: "nats://localhost:4222"
+      subject_tick: "metricsgen.sync.tick"
+      subject_done: "metricsgen.sync.done"
+      instance_id: "a"
+    start_time: "2026-02-14T21:47:41Z"
+    end_time: "2026-02-14T21:52:41Z"
+    interval: 1s
+    threads: 4   # 0 required when scale (1) is not a multiple of default threads (4)
+    real_time: false
+    exit_after_end: true
+    seed: 121
+    scenarios:
+      - path: builtin/hostmetrics
+        scale: 8
+        instance_id_offset: 0
+
+exporters:
+  elasticsearch/otel:
+    endpoints: [ "https://localhost:9200" ]
+    user: elastic
+    password: changeme
+    num_workers: 1
+    metrics_dynamic_index:
+      enabled: true
+    sending_queue:
+      enabled: false
+    mapping:
+      mode: otel
+    tls:
+      insecure_skip_verify: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [ metricsgen ]
+      exporters: [ elasticsearch/otel ]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: "0.0.0.0"
+                port: 8888

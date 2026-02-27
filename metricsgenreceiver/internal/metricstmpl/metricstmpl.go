@@ -72,11 +72,11 @@ func RenderMetricsTemplate(path string, templateModel any) (pmetric.Metrics, err
 	return pmetric.Metrics{}, fmt.Errorf("no .json/.yaml/.yml template file found for %s", path)
 }
 
-func GetResources(path string, startTime time.Time, scale int, vars map[string]any, r *rand.Rand) ([]pcommon.Resource, error) {
+func GetResources(path string, startTime time.Time, scale int, vars map[string]any, r *rand.Rand, instanceIDOffset int) ([]pcommon.Resource, error) {
 	startTimeString := startTime.Format(time.RFC3339)
 	resources := make([]pcommon.Resource, scale)
 	for i := 0; i < scale; i++ {
-		resource, err := RenderResource(path, i, startTimeString, vars, r)
+		resource, err := RenderResource(path, i, startTimeString, vars, r, instanceIDOffset)
 		if err != nil {
 			return nil, err
 		}
@@ -85,9 +85,9 @@ func GetResources(path string, startTime time.Time, scale int, vars map[string]a
 	return resources, nil
 }
 
-func RenderResource(path string, id int, startTimeString string, vars map[string]any, r *rand.Rand) (pcommon.Resource, error) {
+func RenderResource(path string, id int, startTimeString string, vars map[string]any, r *rand.Rand, instanceIDOffset int) (pcommon.Resource, error) {
 	metricsTemplate, err := RenderMetricsTemplate(path+"-resource-attributes", &resourceTemplateModel{
-		InstanceID:        id,
+		InstanceID:        id + instanceIDOffset,
 		InstanceStartTime: startTimeString,
 		Vars:              vars,
 		rand:              r,

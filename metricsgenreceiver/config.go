@@ -19,10 +19,22 @@ type Config struct {
 	RealTime                          bool                         `mapstructure:"real_time"`
 	ExitAfterEnd                      bool                         `mapstructure:"exit_after_end"`
 	ExitAfterEndTimeout               time.Duration                `mapstructure:"exit_after_end_timeout"`
+	Threads                           int                          `mapstructure:"threads"`
 	Seed                              int64                        `mapstructure:"seed"`
 	Scenarios                         []ScenarioCfg                `mapstructure:"scenarios"`
 	Distribution                      distribution.DistributionCfg `mapstructure:"distribution"`
 	ExponentialHistogramsTemplatePath string                       `mapstructure:"exponential_histograms_template_path"`
+	Sync                              *SyncConfig                  `mapstructure:"sync"`
+}
+
+// SyncConfig configures NATS-based coordination so multiple receiver instances
+// generate metrics for the same simulated timestamp, avoiding out-of-order data.
+type SyncConfig struct {
+	Enabled    bool   `mapstructure:"enabled"`
+	NatsURL    string `mapstructure:"nats_url"`
+	SubjectTick string `mapstructure:"subject_tick"`
+	SubjectDone string `mapstructure:"subject_done"`
+	InstanceID string `mapstructure:"instance_id"`
 }
 
 type ScenarioCfg struct {
@@ -30,6 +42,7 @@ type ScenarioCfg struct {
 	Scale               int            `mapstructure:"scale"`
 	Concurrency         int            `mapstructure:"concurrency"`
 	Churn               int            `mapstructure:"churn"`
+	InstanceIDOffset    int            `mapstructure:"instance_id_offset"`
 	TemplateVars        map[string]any `mapstructure:"template_vars"`
 	TemporalityOverride string         `mapstructure:"temporality_override"`
 	HistogramOverride   string         `mapstructure:"histogram_override"`
@@ -59,6 +72,7 @@ func (c ScenarioCfg) ForceExponentialHistograms() bool {
 
 func createDefaultConfig() component.Config {
 	return &Config{
+		Threads:      4,
 		Seed:         0,
 		Scenarios:    make([]ScenarioCfg, 0),
 		Distribution: distribution.DefaultDistribution,
@@ -74,12 +88,37 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("start_time must be before end_time")
 	}
 
+	if cfg.Threads < 0 {
+		return fmt.Errorf("threads must be a positive number")
+	}
+
 	for _, scn := range cfg.Scenarios {
-		if scn.Concurrency != 0 && scn.Scale%scn.Concurrency != 0 {
+		concurrency := scn.Concurrency
+		if cfg.Threads > 0 {
+			concurrency = cfg.Threads
+		}
+		if concurrency != 0 && scn.Scale%concurrency != 0 {
 			return fmt.Errorf("scale must be a multiple of concurrency")
 		}
-		if scn.Concurrency < 0 {
+		if concurrency < 0 {
 			return fmt.Errorf("concurrency must be a positive number")
+		}
+		if scn.InstanceIDOffset < 0 {
+			return fmt.Errorf("instance_id_offset must be non-negative")
+		}
+	}
+	if cfg.Sync != nil && cfg.Sync.Enabled {
+		if cfg.Sync.NatsURL == "" {
+			return fmt.Errorf("sync.nats_url is required when sync is enabled")
+		}
+		if cfg.Sync.SubjectTick == "" {
+			return fmt.Errorf("sync.subject_tick is required when sync is enabled")
+		}
+		if cfg.Sync.SubjectDone == "" {
+			return fmt.Errorf("sync.subject_done is required when sync is enabled")
+		}
+		if cfg.Sync.InstanceID == "" {
+			return fmt.Errorf("sync.instance_id is required when sync is enabled")
 		}
 	}
 	return nil

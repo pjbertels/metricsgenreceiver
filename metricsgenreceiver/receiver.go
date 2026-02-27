@@ -2,9 +2,11 @@ package metricsgenreceiver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/elastic/metricsgenreceiver/metricsgenreceiver/internal/expohistogen"
 	"github.com/elastic/metricsgenreceiver/metricsgenreceiver/internal/metadata"
 	"github.com/elastic/metricsgenreceiver/metricsgenreceiver/internal/metricstmpl"
+	"github.com/nats-io/nats.go"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componentstatus"
 	"go.opentelemetry.io/collector/consumer"
@@ -71,6 +74,10 @@ func (p *MetricsProgress) eta(progressPct float64) time.Duration {
 }
 
 func newMetricsGenReceiver(cfg *Config, set receiver.Settings) (*MetricsGenReceiver, error) {
+	if cfg.Threads > 0 {
+		runtime.GOMAXPROCS(cfg.Threads)
+	}
+
 	obsreport, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
 		ReceiverID:             set.ID,
 		ReceiverCreateSettings: set,
@@ -125,7 +132,7 @@ func newMetricsGenReceiver(cfg *Config, set receiver.Settings) (*MetricsGenRecei
 			}
 
 		})
-		resources, err := metricstmpl.GetResources(scn.Path, cfg.StartTime, scn.Scale, scn.TemplateVars, baseRand)
+		resources, err := metricstmpl.GetResources(scn.Path, cfg.StartTime, scn.Scale, scn.TemplateVars, baseRand, scn.InstanceIDOffset)
 		if err != nil {
 			return nil, err
 		}
@@ -150,50 +157,119 @@ func newMetricsGenReceiver(cfg *Config, set receiver.Settings) (*MetricsGenRecei
 func (r *MetricsGenReceiver) Start(ctx context.Context, host component.Host) error {
 	ctx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
-	go func() {
-		nextLog := r.progress.start.Add(10 * time.Second)
-		ticker := time.NewTicker(r.cfg.Interval)
-		defer ticker.Stop()
-		currentTime := r.cfg.StartTime
-		for i := 0; currentTime.UnixNano() < r.cfg.EndTime.UnixNano(); i++ {
+	if r.cfg.Sync != nil && r.cfg.Sync.Enabled {
+		go r.runSyncLoop(ctx, host)
+	} else {
+		go r.runLocalLoop(ctx, host)
+	}
+	return nil
+}
+
+// runSyncLoop drives generation from NATS tick messages so all instances use the same timestamp.
+func (r *MetricsGenReceiver) runSyncLoop(ctx context.Context, host component.Host) {
+	nc, err := nats.Connect(r.cfg.Sync.NatsURL)
+	if err != nil {
+		r.settings.Logger.Error("sync: failed to connect to NATS", zap.Error(err))
+		return
+	}
+	defer nc.Drain()
+
+	sub, err := nc.SubscribeSync(r.cfg.Sync.SubjectTick)
+	if err != nil {
+		r.settings.Logger.Error("sync: failed to subscribe to tick subject", zap.Error(err))
+		return
+	}
+	defer sub.Unsubscribe()
+
+	nextLog := r.progress.start.Add(10 * time.Second)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		msg, err := sub.NextMsg(time.Minute)
+		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			if time.Now().After(nextLog) {
-				progressPct := currentTime.Sub(r.cfg.StartTime).Seconds() / r.cfg.EndTime.Sub(r.cfg.StartTime).Seconds()
-				r.settings.Logger.Info("generating metrics progress",
-					zap.Int("progress_percent", int(progressPct*100)),
-					zap.String("eta", r.progress.eta(progressPct).Round(time.Second).String()),
-					zap.Uint64("datapoints", r.progress.datapoints.Load()),
-					zap.Float64("data_points_per_second", r.progress.dataPointsPerSecond()),
-				)
-				nextLog = nextLog.Add(10 * time.Second)
-			}
-			simulatedTime := addJitter(currentTime, r.cfg.IntervalJitterStdDev, r.cfg.Interval)
-			r.progress.datapoints.Add(r.produceMetrics(ctx, simulatedTime))
-			r.applyChurn(i, simulatedTime)
-
-			if r.cfg.RealTime {
-				<-ticker.C
-			}
-			currentTime = currentTime.Add(r.cfg.Interval)
+			r.settings.Logger.Debug("sync: next message wait failed", zap.Error(err))
+			continue
 		}
-		if r.cfg.ExitAfterEnd {
-			// After the runner has finished generating metrics, we wait for the configured duration before exiting.
-			if r.cfg.ExitAfterEndTimeout > 0 {
-				r.settings.Logger.Info("finished generating metrics, waiting before exiting",
-					zap.Duration("exit_after_end_timeout", r.cfg.ExitAfterEndTimeout),
-				)
-				time.Sleep(r.cfg.ExitAfterEndTimeout)
-			} else {
-				r.settings.Logger.Info("finished generating metrics, exiting immediately")
-			}
-
-			componentstatus.ReportStatus(host, componentstatus.NewFatalErrorEvent(errors.New("exiting because exit_after_end is set to true")))
+		var currentTime time.Time
+		if err := currentTime.UnmarshalText(msg.Data); err != nil {
+			r.settings.Logger.Error("sync: invalid tick payload (expected RFC3339)", zap.Error(err), zap.ByteString("payload", msg.Data))
+			continue
 		}
-	}()
+		if currentTime.UnixNano() >= r.cfg.EndTime.UnixNano() {
+			r.settings.Logger.Info("sync: received end tick, finishing")
+			if r.cfg.ExitAfterEnd {
+				if r.cfg.ExitAfterEndTimeout > 0 {
+					time.Sleep(r.cfg.ExitAfterEndTimeout)
+				}
+				componentstatus.ReportStatus(host, componentstatus.NewFatalErrorEvent(errors.New("exiting because exit_after_end is set to true")))
+			}
+			return
+		}
+		if time.Now().After(nextLog) {
+			progressPct := currentTime.Sub(r.cfg.StartTime).Seconds() / r.cfg.EndTime.Sub(r.cfg.StartTime).Seconds()
+			r.settings.Logger.Info("generating metrics progress",
+				zap.Int("progress_percent", int(progressPct*100)),
+				zap.String("eta", r.progress.eta(progressPct).Round(time.Second).String()),
+				zap.Uint64("datapoints", r.progress.datapoints.Load()),
+				zap.Float64("data_points_per_second", r.progress.dataPointsPerSecond()),
+			)
+			nextLog = nextLog.Add(10 * time.Second)
+		}
+		intervalNanos := r.cfg.Interval.Nanoseconds()
+		i := int((currentTime.UnixNano() - r.cfg.StartTime.UnixNano()) / intervalNanos)
+		r.progress.datapoints.Add(r.produceMetrics(ctx, currentTime))
+		r.applyChurn(i, currentTime)
+		// Publish done so coordinator can wait for all instances before next tick.
+		donePayload, _ := json.Marshal(map[string]string{"instance_id": r.cfg.Sync.InstanceID, "ts": currentTime.Format(time.RFC3339Nano)})
+		if err := nc.Publish(r.cfg.Sync.SubjectDone, donePayload); err != nil {
+			r.settings.Logger.Warn("sync: failed to publish done", zap.Error(err))
+		}
+	}
+}
 
-	return nil
+func (r *MetricsGenReceiver) runLocalLoop(ctx context.Context, host component.Host) {
+	nextLog := r.progress.start.Add(10 * time.Second)
+	ticker := time.NewTicker(r.cfg.Interval)
+	defer ticker.Stop()
+	currentTime := r.cfg.StartTime
+	for i := 0; currentTime.UnixNano() < r.cfg.EndTime.UnixNano(); i++ {
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Now().After(nextLog) {
+			progressPct := currentTime.Sub(r.cfg.StartTime).Seconds() / r.cfg.EndTime.Sub(r.cfg.StartTime).Seconds()
+			r.settings.Logger.Info("generating metrics progress",
+				zap.Int("progress_percent", int(progressPct*100)),
+				zap.String("eta", r.progress.eta(progressPct).Round(time.Second).String()),
+				zap.Uint64("datapoints", r.progress.datapoints.Load()),
+				zap.Float64("data_points_per_second", r.progress.dataPointsPerSecond()),
+			)
+			nextLog = nextLog.Add(10 * time.Second)
+		}
+		simulatedTime := addJitter(currentTime, r.cfg.IntervalJitterStdDev, r.cfg.Interval)
+		r.progress.datapoints.Add(r.produceMetrics(ctx, simulatedTime))
+		r.applyChurn(i, simulatedTime)
+
+		if r.cfg.RealTime {
+			<-ticker.C
+		}
+		currentTime = currentTime.Add(r.cfg.Interval)
+	}
+	if r.cfg.ExitAfterEnd {
+		if r.cfg.ExitAfterEndTimeout > 0 {
+			r.settings.Logger.Info("finished generating metrics, waiting before exiting",
+				zap.Duration("exit_after_end_timeout", r.cfg.ExitAfterEndTimeout),
+			)
+			time.Sleep(r.cfg.ExitAfterEndTimeout)
+		} else {
+			r.settings.Logger.Info("finished generating metrics, exiting immediately")
+		}
+		componentstatus.ReportStatus(host, componentstatus.NewFatalErrorEvent(errors.New("exiting because exit_after_end is set to true")))
+	}
 }
 
 func replaceHistogramsWithExponentialHistograms(m pmetric.Metric) {
@@ -257,7 +333,7 @@ func (r *MetricsGenReceiver) applyChurn(interval int, simulatedTime time.Time) {
 		startTime := simulatedTime.Format(time.RFC3339)
 		for i := 0; i < scn.config.Churn; i++ {
 			id := scn.config.Scale + interval*scn.config.Churn + i
-			resource, err := metricstmpl.RenderResource(scn.config.Path, id, startTime, scn.config.TemplateVars, r.baseRand)
+			resource, err := metricstmpl.RenderResource(scn.config.Path, id, startTime, scn.config.TemplateVars, r.baseRand, scn.config.InstanceIDOffset)
 			if err != nil {
 				r.settings.Logger.Error("failed to apply churn", zap.Error(err))
 			} else {
@@ -278,26 +354,32 @@ func (r *MetricsGenReceiver) produceMetrics(ctx context.Context, currentTime tim
 		dp.ForEachDataPoint(scn.metricsTemplate, func(res pcommon.Resource, is pcommon.InstrumentationScope, m pmetric.Metric, dp dp.DataPoint) {
 			distribution.AdvanceDataPoint(dp, r.baseRand, m, r.cfg.Distribution, r.expHistoGen)
 		})
-		if scn.config.Concurrency == 0 {
+
+		concurrency := scn.config.Concurrency
+		if r.cfg.Threads > 0 {
+			concurrency = r.cfg.Threads
+		}
+
+		if concurrency == 0 {
 			for i := range scn.config.Scale {
 				*dataPoints += uint64(r.produceMetricsForInstance(ctx, r.baseRand, currentTime, scn, scn.resources[i]))
 			}
 			continue
 		}
 
-		for i := 0; i < scn.config.Concurrency; i++ {
+		for i := 0; i < concurrency; i++ {
 			// Use a new random number generator for each goroutine to avoid race conditions
 			ra := r.getNewRand()
 
 			wg.Add(1)
-			go func() {
+			go func(i int) {
 				defer wg.Done()
-				for j := 0; j < scn.config.Scale/scn.config.Concurrency; j++ {
-					resource := scn.resources[j+i*scn.config.Scale/scn.config.Concurrency]
+				for j := 0; j < scn.config.Scale/concurrency; j++ {
+					resource := scn.resources[j+i*scn.config.Scale/concurrency]
 					currentDataPoints := r.produceMetricsForInstance(ctx, ra, currentTime, scn, resource)
 					atomic.AddUint64(dataPoints, uint64(currentDataPoints))
 				}
-			}()
+			}(i)
 		}
 	}
 	wg.Wait()
