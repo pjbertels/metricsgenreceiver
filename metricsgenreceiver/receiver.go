@@ -38,6 +38,16 @@ type MetricsGenReceiver struct {
 	cancel      context.CancelFunc
 	scenarios   []Scenario
 	progress    *MetricsProgress
+
+	// syncAssignment is set when get_assignment_from_coordinator is used; holds effective start/end and instance_id for the sync loop.
+	syncAssignment *syncAssignment
+}
+
+type syncAssignment struct {
+	StartTime        time.Time
+	EndTime          time.Time
+	InstanceID       string
+	InstanceIDOffset int
 }
 
 type Scenario struct {
@@ -86,61 +96,30 @@ func newMetricsGenReceiver(cfg *Config, set receiver.Settings) (*MetricsGenRecei
 		return nil, err
 	}
 
-	nowish := time.Now().Truncate(time.Second)
-	if cfg.StartTime.IsZero() {
-		cfg.StartTime = nowish.Add(-cfg.StartNowMinus)
-	}
-	if cfg.EndTime.IsZero() {
-		cfg.EndTime = nowish.Add(-cfg.EndNowMinus)
+	getAssignment := cfg.Sync != nil && cfg.Sync.Enabled && cfg.Sync.GetAssignmentFromCoordinator
+	if !getAssignment {
+		nowish := time.Now().Truncate(time.Second)
+		if cfg.StartTime.IsZero() {
+			cfg.StartTime = nowish.Add(-cfg.StartNowMinus)
+		}
+		if cfg.EndTime.IsZero() {
+			cfg.EndTime = nowish.Add(-cfg.EndNowMinus)
+		}
 	}
 
-	baseRand := rand.New(rand.NewSource(cfg.Seed))
 	expHistoGen, err := expohistogen.NewGenerator(cfg.GetExponentialHistogramsTemplatePath())
 	if err != nil {
 		return nil, err
 	}
 
-	scenarios := make([]Scenario, 0, len(cfg.Scenarios))
-	for _, scn := range cfg.Scenarios {
-
-		metrics, err := metricstmpl.RenderMetricsTemplate(scn.Path, scn.TemplateVars)
+	var baseRand *rand.Rand
+	var scenarios []Scenario
+	if !getAssignment {
+		baseRand = rand.New(rand.NewSource(cfg.Seed))
+		scenarios, err = buildScenarios(cfg, cfg.StartTime, cfg.Seed, nil, baseRand, expHistoGen)
 		if err != nil {
 			return nil, err
 		}
-
-		if scn.ForceExponentialHistograms() {
-			dp.ForEachMetric(&metrics, func(res pcommon.Resource, is pcommon.InstrumentationScope, m pmetric.Metric) {
-				replaceHistogramsWithExponentialHistograms(m)
-			})
-		}
-		dp.ForEachDataPoint(&metrics, func(res pcommon.Resource, is pcommon.InstrumentationScope, m pmetric.Metric, dp dp.DataPoint) {
-			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(cfg.StartTime))
-			if scn.AggregationTemporalityOverride() != pmetric.AggregationTemporalityUnspecified {
-				switch m.Type() {
-				case pmetric.MetricTypeSum:
-					m.Sum().SetAggregationTemporality(scn.AggregationTemporalityOverride())
-				case pmetric.MetricTypeHistogram:
-					m.Histogram().SetAggregationTemporality(scn.AggregationTemporalityOverride())
-				default:
-					// no-op
-				}
-			}
-			// initialize exponential histograms with clean values and set their temporality to delta as we currently only support that
-			if m.Type() == pmetric.MetricTypeExponentialHistogram {
-				expHistoGen.GenerateInto(baseRand, dp.(pmetric.ExponentialHistogramDataPoint))
-				m.ExponentialHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
-			}
-
-		})
-		resources, err := metricstmpl.GetResources(scn.Path, cfg.StartTime, scn.Scale, scn.TemplateVars, baseRand, scn.InstanceIDOffset)
-		if err != nil {
-			return nil, err
-		}
-		scenarios = append(scenarios, Scenario{
-			config:          scn,
-			metricsTemplate: &metrics,
-			resources:       resources,
-		})
 	}
 
 	return &MetricsGenReceiver{
@@ -152,6 +131,55 @@ func newMetricsGenReceiver(cfg *Config, set receiver.Settings) (*MetricsGenRecei
 		scenarios:   scenarios,
 		progress:    newMetricsProgress(),
 	}, nil
+}
+
+// buildScenarios builds scenarios from cfg. If perScenarioOffset is nil, scn.InstanceIDOffset is used per scenario; otherwise the single offset is used for all.
+func buildScenarios(cfg *Config, startTime time.Time, seed int64, instanceIDOffset *int, baseRand *rand.Rand, expHistoGen *expohistogen.Generator) ([]Scenario, error) {
+	if baseRand == nil {
+		baseRand = rand.New(rand.NewSource(seed))
+	}
+	scenarios := make([]Scenario, 0, len(cfg.Scenarios))
+	for _, scn := range cfg.Scenarios {
+		metrics, err := metricstmpl.RenderMetricsTemplate(scn.Path, scn.TemplateVars)
+		if err != nil {
+			return nil, err
+		}
+		offset := scn.InstanceIDOffset
+		if instanceIDOffset != nil {
+			offset = *instanceIDOffset
+		}
+		if scn.ForceExponentialHistograms() {
+			dp.ForEachMetric(&metrics, func(res pcommon.Resource, is pcommon.InstrumentationScope, m pmetric.Metric) {
+				replaceHistogramsWithExponentialHistograms(m)
+			})
+		}
+		dp.ForEachDataPoint(&metrics, func(res pcommon.Resource, is pcommon.InstrumentationScope, m pmetric.Metric, dp dp.DataPoint) {
+			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(startTime))
+			if scn.AggregationTemporalityOverride() != pmetric.AggregationTemporalityUnspecified {
+				switch m.Type() {
+				case pmetric.MetricTypeSum:
+					m.Sum().SetAggregationTemporality(scn.AggregationTemporalityOverride())
+				case pmetric.MetricTypeHistogram:
+					m.Histogram().SetAggregationTemporality(scn.AggregationTemporalityOverride())
+				default:
+				}
+			}
+			if m.Type() == pmetric.MetricTypeExponentialHistogram {
+				expHistoGen.GenerateInto(baseRand, dp.(pmetric.ExponentialHistogramDataPoint))
+				m.ExponentialHistogram().SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			}
+		})
+		resources, err := metricstmpl.GetResources(scn.Path, startTime, scn.Scale, scn.TemplateVars, baseRand, offset)
+		if err != nil {
+			return nil, err
+		}
+		scenarios = append(scenarios, Scenario{
+			config:          scn,
+			metricsTemplate: &metrics,
+			resources:       resources,
+		})
+	}
+	return scenarios, nil
 }
 
 func (r *MetricsGenReceiver) Start(ctx context.Context, host component.Host) error {
@@ -173,6 +201,58 @@ func (r *MetricsGenReceiver) runSyncLoop(ctx context.Context, host component.Hos
 		return
 	}
 	defer nc.Drain()
+
+	var effectiveStart, effectiveEnd time.Time
+	instanceID := r.cfg.Sync.InstanceID
+	if r.cfg.Sync.GetAssignmentFromCoordinator {
+		// Request assignment from coordinator.
+		reply, err := nc.Request(r.cfg.Sync.SubjectJoin, nil, 30*time.Second)
+		if err != nil {
+			r.settings.Logger.Error("sync: failed to get assignment from coordinator", zap.Error(err))
+			return
+		}
+		var assignment struct {
+			Seed             int64  `json:"seed"`
+			StartTime        string `json:"start_time"`
+			EndTime          string `json:"end_time"`
+			InstanceID       string `json:"instance_id"`
+			InstanceIDOffset int    `json:"instance_id_offset"`
+		}
+		if err := json.Unmarshal(reply.Data, &assignment); err != nil {
+			r.settings.Logger.Error("sync: invalid assignment payload", zap.Error(err), zap.ByteString("payload", reply.Data))
+			return
+		}
+		effectiveStart, err = time.Parse(time.RFC3339, assignment.StartTime)
+		if err != nil {
+			r.settings.Logger.Error("sync: invalid start_time in assignment", zap.Error(err))
+			return
+		}
+		effectiveEnd, err = time.Parse(time.RFC3339, assignment.EndTime)
+		if err != nil {
+			r.settings.Logger.Error("sync: invalid end_time in assignment", zap.Error(err))
+			return
+		}
+		instanceID = assignment.InstanceID
+		r.syncAssignment = &syncAssignment{
+			StartTime:        effectiveStart,
+			EndTime:          effectiveEnd,
+			InstanceID:       instanceID,
+			InstanceIDOffset: assignment.InstanceIDOffset,
+		}
+		r.settings.Logger.Info("sync: got assignment", zap.String("instance_id", instanceID), zap.Int("instance_id_offset", assignment.InstanceIDOffset), zap.Int64("seed", assignment.Seed))
+		// Build scenarios and baseRand from assignment.
+		offset := assignment.InstanceIDOffset
+		r.baseRand = rand.New(rand.NewSource(assignment.Seed))
+		scenarios, err := buildScenarios(r.cfg, effectiveStart, assignment.Seed, &offset, r.baseRand, r.expHistoGen)
+		if err != nil {
+			r.settings.Logger.Error("sync: failed to build scenarios from assignment", zap.Error(err))
+			return
+		}
+		r.scenarios = scenarios
+	} else {
+		effectiveStart = r.cfg.StartTime
+		effectiveEnd = r.cfg.EndTime
+	}
 
 	sub, err := nc.SubscribeSync(r.cfg.Sync.SubjectTick)
 	if err != nil {
@@ -199,7 +279,7 @@ func (r *MetricsGenReceiver) runSyncLoop(ctx context.Context, host component.Hos
 			r.settings.Logger.Error("sync: invalid tick payload (expected RFC3339)", zap.Error(err), zap.ByteString("payload", msg.Data))
 			continue
 		}
-		if currentTime.UnixNano() >= r.cfg.EndTime.UnixNano() {
+		if currentTime.UnixNano() >= effectiveEnd.UnixNano() {
 			r.settings.Logger.Info("sync: received end tick, finishing")
 			if r.cfg.ExitAfterEnd {
 				if r.cfg.ExitAfterEndTimeout > 0 {
@@ -210,7 +290,7 @@ func (r *MetricsGenReceiver) runSyncLoop(ctx context.Context, host component.Hos
 			return
 		}
 		if time.Now().After(nextLog) {
-			progressPct := currentTime.Sub(r.cfg.StartTime).Seconds() / r.cfg.EndTime.Sub(r.cfg.StartTime).Seconds()
+			progressPct := currentTime.Sub(effectiveStart).Seconds() / effectiveEnd.Sub(effectiveStart).Seconds()
 			r.settings.Logger.Info("generating metrics progress",
 				zap.Int("progress_percent", int(progressPct*100)),
 				zap.String("eta", r.progress.eta(progressPct).Round(time.Second).String()),
@@ -220,11 +300,11 @@ func (r *MetricsGenReceiver) runSyncLoop(ctx context.Context, host component.Hos
 			nextLog = nextLog.Add(10 * time.Second)
 		}
 		intervalNanos := r.cfg.Interval.Nanoseconds()
-		i := int((currentTime.UnixNano() - r.cfg.StartTime.UnixNano()) / intervalNanos)
+		i := int((currentTime.UnixNano() - effectiveStart.UnixNano()) / intervalNanos)
 		r.progress.datapoints.Add(r.produceMetrics(ctx, currentTime))
 		r.applyChurn(i, currentTime)
 		// Publish done so coordinator can wait for all instances before next tick.
-		donePayload, _ := json.Marshal(map[string]string{"instance_id": r.cfg.Sync.InstanceID, "ts": currentTime.Format(time.RFC3339Nano)})
+		donePayload, _ := json.Marshal(map[string]string{"instance_id": instanceID, "ts": currentTime.Format(time.RFC3339Nano)})
 		if err := nc.Publish(r.cfg.Sync.SubjectDone, donePayload); err != nil {
 			r.settings.Logger.Warn("sync: failed to publish done", zap.Error(err))
 		}
@@ -329,11 +409,14 @@ func (r *MetricsGenReceiver) applyChurn(interval int, simulatedTime time.Time) {
 		if scn.config.Churn == 0 {
 			continue
 		}
-
+		offset := scn.config.InstanceIDOffset
+		if r.syncAssignment != nil {
+			offset = r.syncAssignment.InstanceIDOffset
+		}
 		startTime := simulatedTime.Format(time.RFC3339)
 		for i := 0; i < scn.config.Churn; i++ {
 			id := scn.config.Scale + interval*scn.config.Churn + i
-			resource, err := metricstmpl.RenderResource(scn.config.Path, id, startTime, scn.config.TemplateVars, r.baseRand, scn.config.InstanceIDOffset)
+			resource, err := metricstmpl.RenderResource(scn.config.Path, id, startTime, scn.config.TemplateVars, r.baseRand, offset)
 			if err != nil {
 				r.settings.Logger.Error("failed to apply churn", zap.Error(err))
 			} else {

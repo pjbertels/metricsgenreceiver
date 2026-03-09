@@ -2,6 +2,7 @@ metricsgen:
   start_time: "2024-12-17T00:00:00Z"
   end_time: "2024-12-17T00:00:31Z"
   interval: 30s
+  threads: 0
   seed: 123
   scenarios:
     - path: testdata/metricstemplate

@@ -30,11 +30,13 @@ type Config struct {
 // SyncConfig configures NATS-based coordination so multiple receiver instances
 // generate metrics for the same simulated timestamp, avoiding out-of-order data.
 type SyncConfig struct {
-	Enabled    bool   `mapstructure:"enabled"`
-	NatsURL    string `mapstructure:"nats_url"`
-	SubjectTick string `mapstructure:"subject_tick"`
-	SubjectDone string `mapstructure:"subject_done"`
-	InstanceID string `mapstructure:"instance_id"`
+	Enabled                      bool   `mapstructure:"enabled"`
+	GetAssignmentFromCoordinator bool   `mapstructure:"get_assignment_from_coordinator"`
+	NatsURL                      string `mapstructure:"nats_url"`
+	SubjectJoin                  string `mapstructure:"subject_join"`
+	SubjectTick                  string `mapstructure:"subject_tick"`
+	SubjectDone                  string `mapstructure:"subject_done"`
+	InstanceID                   string `mapstructure:"instance_id"`
 }
 
 type ScenarioCfg struct {
@@ -84,7 +86,8 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("the interval has to be set to at least 1 second (1s)")
 	}
 
-	if cfg.StartTime.After(cfg.EndTime) {
+	getAssignment := cfg.Sync != nil && cfg.Sync.Enabled && cfg.Sync.GetAssignmentFromCoordinator
+	if !getAssignment && cfg.StartTime.After(cfg.EndTime) {
 		return fmt.Errorf("start_time must be before end_time")
 	}
 
@@ -103,7 +106,7 @@ func (cfg *Config) Validate() error {
 		if concurrency < 0 {
 			return fmt.Errorf("concurrency must be a positive number")
 		}
-		if scn.InstanceIDOffset < 0 {
+		if !getAssignment && scn.InstanceIDOffset < 0 {
 			return fmt.Errorf("instance_id_offset must be non-negative")
 		}
 	}
@@ -117,8 +120,14 @@ func (cfg *Config) Validate() error {
 		if cfg.Sync.SubjectDone == "" {
 			return fmt.Errorf("sync.subject_done is required when sync is enabled")
 		}
-		if cfg.Sync.InstanceID == "" {
-			return fmt.Errorf("sync.instance_id is required when sync is enabled")
+		if cfg.Sync.GetAssignmentFromCoordinator {
+			if cfg.Sync.SubjectJoin == "" {
+				return fmt.Errorf("sync.subject_join is required when sync.get_assignment_from_coordinator is true")
+			}
+		} else {
+			if cfg.Sync.InstanceID == "" {
+				return fmt.Errorf("sync.instance_id is required when sync is enabled and get_assignment_from_coordinator is false")
+			}
 		}
 	}
 	return nil

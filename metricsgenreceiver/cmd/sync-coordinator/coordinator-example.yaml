@@ -1,19 +1,28 @@
-# Coordinator config for the sync example (two collectors, 5m @ 1s interval).
-# Matches docs/sync-otelcol-instance-a.yaml and docs/sync-otelcol-instance-b.yaml.
+# Coordinator config for the sync example (coordinator-assigned mode).
+# When subject_join is set, the coordinator waits for num_instances to join, assigns each
+# seed/start_time/end_time/instance_id/instance_id_offset, then runs the tick loop.
 #
-# Run from the metricsgenreceiver directory:
-#   go run ./cmd/sync-coordinator -config cmd/sync-coordinator/coordinator-example.yaml
+# Run from the repo root:
+#   ./sync-coordinator -config metricsgenreceiver/cmd/sync-coordinator/coordinator-example.yaml
 #
 # Ensure NATS is running (e.g. docker run -p 4222:4222 nats:latest).
-# Start both collectors (instance A and B), then start this coordinator.
+# Start num_instances collectors with the same config (get_assignment_from_coordinator: true), then start this coordinator.
 
 nats_url: "nats://localhost:4222"
+subject_join: "metricsgen.sync.join"
 subject_tick: "metricsgen.sync.tick"
 subject_done: "metricsgen.sync.done"
 num_instances: 2
+base_seed: 123
+# instance_id_offset for slot i = i * scale_per_instance (e.g. 0 and 100 for two instances with scale 100 each)
+scale_per_instance: 10
+
+# Delay after all instances have joined before publishing the first tick, so the last
+# joiner has time to build scenarios and subscribe to the tick subject (default 5s).
+start_delay: 5s
 
 start_time: "2026-02-14T21:47:41Z"
 end_time: "2026-02-14T21:52:41Z"
-interval: 1s
+interval: 10s
 
 done_timeout: 5m

@@ -16,14 +16,18 @@ import (
 )
 
 type config struct {
-	NatsURL      string        `yaml:"nats_url"`
-	SubjectTick  string        `yaml:"subject_tick"`
-	SubjectDone  string        `yaml:"subject_done"`
-	NumInstances int           `yaml:"num_instances"`
-	StartTime    string        `yaml:"start_time"` // RFC3339
-	EndTime      string        `yaml:"end_time"`   // RFC3339
-	Interval     time.Duration `yaml:"interval"`
-	DoneTimeout  time.Duration `yaml:"done_timeout"` // max wait for N dones per tick (default 5m)
+	NatsURL          string        `yaml:"nats_url"`
+	SubjectJoin      string        `yaml:"subject_join"`
+	SubjectTick      string        `yaml:"subject_tick"`
+	SubjectDone      string        `yaml:"subject_done"`
+	NumInstances     int           `yaml:"num_instances"`
+	BaseSeed         int64         `yaml:"base_seed"`
+	ScalePerInstance int           `yaml:"scale_per_instance"`
+	StartDelay       time.Duration `yaml:"start_delay"` // delay after all joined before first tick (so last joiner can subscribe)
+	StartTime        string        `yaml:"start_time"`  // RFC3339
+	EndTime          string        `yaml:"end_time"`    // RFC3339
+	Interval         time.Duration `yaml:"interval"`
+	DoneTimeout      time.Duration `yaml:"done_timeout"` // max wait for N dones per tick (default 5m)
 }
 
 func main() {
@@ -45,11 +49,17 @@ func main() {
 	if cfg.DoneTimeout == 0 {
 		cfg.DoneTimeout = 5 * time.Minute
 	}
+	if cfg.SubjectJoin != "" && cfg.StartDelay == 0 {
+		cfg.StartDelay = 5 * time.Second
+	}
 	if cfg.NumInstances < 1 {
 		log.Fatal("num_instances must be at least 1")
 	}
 	if cfg.SubjectTick == "" || cfg.SubjectDone == "" {
 		log.Fatal("subject_tick and subject_done are required")
+	}
+	if cfg.SubjectJoin != "" && cfg.ScalePerInstance < 0 {
+		log.Fatal("scale_per_instance must be non-negative when subject_join is set")
 	}
 	if cfg.NatsURL == "" {
 		cfg.NatsURL = nats.DefaultURL
@@ -72,6 +82,66 @@ func main() {
 		log.Fatalf("connect to NATS: %v", err)
 	}
 	defer nc.Drain()
+
+	// If join subject is set, wait for N instances to join before starting the tick loop.
+	if cfg.SubjectJoin != "" {
+		log.Printf("join mode enabled: waiting for %d instance(s) on %s before publishing any tick", cfg.NumInstances, cfg.SubjectJoin)
+		type assignmentPayload struct {
+			Seed             int64  `json:"seed"`
+			StartTime        string `json:"start_time"`
+			EndTime          string `json:"end_time"`
+			InstanceID       string `json:"instance_id"`
+			InstanceIDOffset int    `json:"instance_id_offset"`
+		}
+		var joinMu sync.Mutex
+		joinCount := 0
+		allJoined := make(chan struct{})
+		_, err = nc.Subscribe(cfg.SubjectJoin, func(msg *nats.Msg) {
+			joinMu.Lock()
+			slot := joinCount
+			if slot >= cfg.NumInstances {
+				joinMu.Unlock()
+				log.Printf("join request ignored (already have %d instances)", cfg.NumInstances)
+				return
+			}
+			joinCount++
+			reached := joinCount == cfg.NumInstances
+			joinMu.Unlock()
+
+			log.Printf("join received: instance %d/%d joining", joinCount, cfg.NumInstances)
+
+			seed := cfg.BaseSeed + int64(slot)
+			offset := slot * cfg.ScalePerInstance
+			payload := assignmentPayload{
+				Seed:             seed,
+				StartTime:        cfg.StartTime,
+				EndTime:          cfg.EndTime,
+				InstanceID:       fmt.Sprintf("%d", slot),
+				InstanceIDOffset: offset,
+			}
+			data, _ := json.Marshal(payload)
+			if err := msg.Respond(data); err != nil {
+				log.Printf("respond to join: %v", err)
+				return
+			}
+			log.Printf("join assigned slot %d: seed=%d instance_id=%s instance_id_offset=%d", slot, seed, payload.InstanceID, offset)
+			if reached {
+				close(allJoined)
+			}
+		})
+		if err != nil {
+			log.Fatalf("subscribe to join: %v", err)
+		}
+		log.Printf("waiting for %d instance(s) on %s ...", cfg.NumInstances, cfg.SubjectJoin)
+		<-allJoined
+		log.Printf("all %d instances joined, starting tick loop", cfg.NumInstances)
+		if cfg.StartDelay > 0 {
+			log.Printf("waiting %v for receivers to subscribe to tick subject before first tick", cfg.StartDelay)
+			time.Sleep(cfg.StartDelay)
+		}
+	} else {
+		log.Printf("no subject_join configured; starting tick loop immediately (receivers must already be subscribed)")
+	}
 
 	// Subscribe to done before publishing any tick so we don't miss messages.
 	type doneMsg struct {

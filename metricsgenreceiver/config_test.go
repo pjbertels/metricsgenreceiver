@@ -33,6 +33,7 @@ func testdataConfigYamlAsMap() *Config {
 		StartTime: startTime,
 		EndTime:   endTime,
 		Interval:  interval,
+		Threads:   0,
 		Seed:      123,
 		Scenarios: []ScenarioCfg{
 			{
